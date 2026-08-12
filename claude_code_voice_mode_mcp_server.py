@@ -30,6 +30,7 @@ from mcp.types import TextContent, Tool
 ALLTALK_URL = "http://127.0.0.1:7851"
 WHISPER_URL = "http://127.0.0.1:8787"
 DEFAULT_VOICE = "Freya.wav"
+PLAYBACK_SPEED = 1.0  # 0.5 = half speed, 1.0 = normal, 2.0 = double speed
 SAMPLE_RATE = 16000
 CHANNELS = 1
 VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive filtering
@@ -54,6 +55,8 @@ logger = logging.getLogger(__name__)
 # Global state
 # ---------------------------------------------------------------------------
 current_voice = DEFAULT_VOICE
+current_speed = 1.0  # Playback speed (0.5-2.0)
+current_temperature = 1.1  # TTS generation temperature (0.1-1.5)
 mic_muted = False
 _streaming_available: Optional[bool] = None  # None = not yet checked
 mic_mode = "push_to_talk"  # push_to_talk, toggle
@@ -83,6 +86,11 @@ def _get_input_device_index() -> Optional[int]:
     except Exception as e:
         logger.warning(f"Could not read input device from state: {e}")
         return None
+
+
+def get_playback_speed() -> float:
+    """Return the current playback speed."""
+    return current_speed
 
 
 def is_tts_paused() -> bool:
@@ -212,7 +220,8 @@ def play_audio_from_url(url: str):
         audio_stream = next(s for s in container.streams if s.type == "audio")
 
         frames = []
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=24000)
+        base_rate = 24000
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=base_rate)
         for frame in container.decode(audio_stream):
             resampled = resampler.resample(frame)
             for r in resampled:
@@ -220,7 +229,8 @@ def play_audio_from_url(url: str):
 
         if frames:
             audio = np.concatenate(frames).astype(np.float32) / 32768.0
-            sd.play(audio, samplerate=24000)
+            playback_sr = int(base_rate * get_playback_speed())
+            sd.play(audio, samplerate=playback_sr)
             _wait_for_playback_or_pause()
 
         Path(tmp_path).unlink(missing_ok=True)
@@ -246,7 +256,8 @@ def play_audio_bytes(audio_bytes: bytes):
 
         if frames:
             audio = np.concatenate(frames).astype(np.float32) / 32768.0
-            sd.play(audio, samplerate=target_rate)
+            playback_sr = int(target_rate * get_playback_speed())
+            sd.play(audio, samplerate=playback_sr)
             _wait_for_playback_or_pause()
     except Exception as e:
         logger.error(f"Audio playback failed: {e}")
@@ -294,6 +305,7 @@ def speak_text_streaming(text: str, voice: str) -> dict:
         "voice": voice,
         "language": "en",
         "output_file": "streaming_output.wav",
+        "temperature": str(current_temperature),
     }
     response = requests.get(
         f"{ALLTALK_URL}/api/tts-generate-streaming",
@@ -328,12 +340,15 @@ def speak_text_streaming(text: str, voice: str) -> dict:
     dtype = "int16" if fmt["bits_per_sample"] == 16 else "int32"
     frame_size = fmt["block_align"]  # bytes per frame (channels * bytes_per_sample)
 
+    # Apply playback speed by adjusting output sample rate
+    speed = get_playback_speed()
+    playback_sr = int(sr * speed)
     logger.info(
-        f"Streaming TTS: {sr}Hz, {ch}ch, {fmt['bits_per_sample']}bit"
+        f"Streaming TTS: {sr}Hz, {ch}ch, {fmt['bits_per_sample']}bit, speed={speed}x (playback_sr={playback_sr}Hz)"
     )
 
     stream = sd.RawOutputStream(
-        samplerate=sr, channels=ch, dtype=dtype
+        samplerate=playback_sr, channels=ch, dtype=dtype
     )
     stream.start()
     logger.info(
@@ -507,10 +522,10 @@ def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
             "output_file_timestamp": "true",
             "autoplay": "false",
             "autoplay_volume": "0.8",
-            "speed": "1.0",
+            "speed": "0.25",
             "pitch": "1.0",
-            "temperature": "0.75",
-            "repetition_penalty": "1.0",
+            "temperature": str(current_temperature),
+            "repetition_penalty": "10.0",
         }
         response = requests.post(f"{ALLTALK_URL}/api/tts-generate", data=payload, timeout=30)
         if response.status_code == 200:
@@ -789,6 +804,34 @@ async def list_tools():
             },
         ),
         Tool(
+            name="set_speed",
+            description="Change the TTS playback speed. Adjusts sample rate for faster/slower speech. Range: 0.5 (half speed) to 2.0 (double speed). Default: 1.0.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "speed": {
+                        "type": "number",
+                        "description": "Playback speed multiplier (0.5-2.0, default 1.0)",
+                    },
+                },
+                "required": ["speed"],
+            },
+        ),
+        Tool(
+            name="set_temperature",
+            description="Change the TTS generation temperature. Higher values produce more varied/expressive speech, lower values are more consistent. Range: 0.1 to 1.5. Default: 0.75.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "temperature": {
+                        "type": "number",
+                        "description": "Temperature value (0.1-1.5, default 0.75)",
+                    },
+                },
+                "required": ["temperature"],
+            },
+        ),
+        Tool(
             name="voice_status",
             description="Check status of AllTalk TTS and Whisper STT services, and list available voices.",
             inputSchema={
@@ -801,7 +844,7 @@ async def list_tools():
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
-    global current_voice, _services_available
+    global current_voice, current_speed, current_temperature, _services_available
 
     # voice_status always allowed (reports service state for diagnostics)
     if name != "voice_status" and not _services_available:
@@ -873,8 +916,22 @@ async def call_tool(name: str, arguments: dict):
         logger.info(f"Voice changed to: {current_voice}")
         return [TextContent(type="text", text=f"Voice set to: {current_voice}")]
 
+    elif name == "set_speed":
+        speed = arguments.get("speed", 1.0)
+        speed = max(0.5, min(2.0, float(speed)))
+        current_speed = speed
+        logger.info(f"Playback speed changed to: {current_speed}x")
+        return [TextContent(type="text", text=f"Playback speed set to: {current_speed}x")]
+
+    elif name == "set_temperature":
+        temp = arguments.get("temperature", 0.75)
+        temp = max(0.1, min(1.5, float(temp)))
+        current_temperature = temp
+        logger.info(f"Temperature changed to: {current_temperature}")
+        return [TextContent(type="text", text=f"Temperature set to: {current_temperature}")]
+
     elif name == "voice_status":
-        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "voices": [], "tts_paused": is_tts_paused(), "streaming_available": _streaming_available, "voice_mode_disabled": _voice_mode_disabled}
+        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "speed": get_playback_speed(), "temperature": current_temperature, "voices": [], "tts_paused": is_tts_paused(), "streaming_available": _streaming_available, "voice_mode_disabled": _voice_mode_disabled}
         try:
             r = requests.get(f"{ALLTALK_URL}/api/ready", timeout=3)
             status["alltalk"] = "ready" if r.status_code == 200 else f"error ({r.status_code})"

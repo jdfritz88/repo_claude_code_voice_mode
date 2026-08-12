@@ -23,46 +23,21 @@ goto start_services
 
 :start_services
 
-REM --- Detect already-running services ---
+REM --- Detect already-running mic panel ---
 set MIC_RUNNING=0
-set WHISPER_RUNNING=0
-set ALLTALK_RUNNING=0
-
 tasklist /fi "WINDOWTITLE eq Claude Code Voice Mode Mic*" 2>nul | find /i "python" >nul 2>&1
 if not errorlevel 1 set MIC_RUNNING=1
 
-curl -s http://127.0.0.1:8787/health >nul 2>&1
-if not errorlevel 1 set WHISPER_RUNNING=1
-
-curl -s http://127.0.0.1:7851/api/ready >nul 2>&1
-if not errorlevel 1 set ALLTALK_RUNNING=1
-
-REM --- Start Microphone Control Panel (no console window) ---
+REM --- Start Microphone Control Panel (it auto-starts Whisper + AllTalk) ---
 if "%MIC_RUNNING%"=="1" (
-    echo [1/3] Microphone Control Panel already running - skipping
+    echo [1/1] Microphone Control Panel already running - skipping
 ) else (
-    echo [1/3] Starting Microphone Control Panel...
+    echo [1/1] Starting Microphone Control Panel...
+    echo        (Mic Panel will auto-start Whisper and AllTalk)
     start "" /d "F:\Apps\freedom_system\REPO_claude_code_voice_mode" venv\Scripts\pythonw.exe mic_panel.py
 )
 
-REM --- Start Whisper STT ---
-if "%WHISPER_RUNNING%"=="1" (
-    echo [2/3] Whisper STT already running on port 8787 - skipping
-) else (
-    echo [2/3] Starting Whisper STT on port 8787...
-    start "Whisper STT" cmd /k "cd /d F:\Apps\freedom_system\app_cabinet\whisper_stt && call venv\Scripts\activate.bat && python server.py"
-)
-
-REM --- Start AllTalk TTS (delay so its window appears in front) ---
-if "%ALLTALK_RUNNING%"=="1" (
-    echo [3/3] AllTalk TTS already running on port 7851 - skipping
-) else (
-    timeout /t 4 /nobreak >nul 2>&1
-    echo [3/3] Starting AllTalk TTS on port 7851...
-    start "AllTalk TTS" cmd /k "cd /d F:\Apps\freedom_system\app_cabinet\alltalk_tts && call start_alltalk.bat"
-)
-
-REM --- Wait for services ---
+REM --- Wait for services (now started by Mic Panel) ---
 echo.
 echo Waiting for services to be ready...
 :wait_loop
@@ -87,7 +62,7 @@ echo ========================================
 echo  All services ready!
 echo  AllTalk TTS:  http://127.0.0.1:7851
 echo  Whisper STT:  http://127.0.0.1:8787
-echo  Mic Panel:    Running
+echo  Mic Panel:    Running (controls all services)
 echo ========================================
 echo.
 
@@ -97,7 +72,7 @@ goto launch_terminal
 :launch_vscode
 echo Starting VS Code with Claude Code...
 "F:\Apps\VSCode\bin\code.cmd" "F:\Apps\freedom_system"
-goto running
+goto done
 
 :launch_terminal
 setlocal enabledelayedexpansion
@@ -155,46 +130,17 @@ echo  Terminal name: !TERMINAL_NAME!
 endlocal & set "SELECTED_DIR=%SELECTED_DIR%" & set "TERMINAL_NAME=%TERMINAL_NAME%"
 
 start "%TERMINAL_NAME%" cmd /k "title %TERMINAL_NAME% && cd /d %SELECTED_DIR% && echo. && echo  Claude Code Voice Mode is ready. && echo  Terminal: %TERMINAL_NAME% && echo  AllTalk TTS: http://127.0.0.1:7851 && echo  Whisper STT: http://127.0.0.1:8787 && echo. && echo  Type your commands below. && echo."
-goto running
+goto done
 
-:running
+:done
 echo.
 echo ========================================
 echo  Claude Code Voice Mode is running.
-echo  Close this window to shut down all
-echo  voice services.
+echo  Use the Mic Panel to manage services
+echo  (restart, shutdown, open new terminals).
 echo ========================================
 echo.
-echo Press any key to shut down all services...
-pause >nul
-
+echo This launcher window can be closed safely.
+echo Services are managed by the Mic Panel.
 echo.
-echo Shutting down services...
-
-REM --- Kill by port: find PID, try graceful then force ---
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":7851 " ^| findstr "LISTENING"') do (
-    echo   Stopping AllTalk TTS (PID %%P)...
-    taskkill /pid %%P >nul 2>&1
-    timeout /t 5 /nobreak >nul 2>&1
-    taskkill /pid %%P /t /f >nul 2>&1
-)
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8787 " ^| findstr "LISTENING"') do (
-    echo   Stopping Whisper STT (PID %%P)...
-    taskkill /pid %%P >nul 2>&1
-    timeout /t 5 /nobreak >nul 2>&1
-    taskkill /pid %%P /t /f >nul 2>&1
-)
-REM --- Kill all Claude Code terminals (by command line pattern) ---
-setlocal enabledelayedexpansion
-for /f "tokens=2 delims=," %%A in ('tasklist /fi "IMAGENAME eq cmd.exe" /fo csv /nh 2^>nul') do (
-    set "CPID=%%~A"
-    if defined CPID (
-        wmic process where "processid=!CPID!" get commandline 2>nul | findstr /i /c:"title " | findstr /r "_[0-9][0-9]" >nul 2>&1
-        if not errorlevel 1 (
-            echo   Stopping Claude Code terminal ^(PID !CPID!^)...
-            taskkill /pid !CPID! /t /f >nul 2>&1
-        )
-    )
-)
-endlocal
-echo Done.
+pause

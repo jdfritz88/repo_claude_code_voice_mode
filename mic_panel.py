@@ -4,6 +4,9 @@ Always-on-top floating window with:
 - Push to Talk (hold button)
 - Toggle to Talk (click to start/stop)
 - Mic volume slider
+- Slide-out Settings and Console panels
+- Live service console capture (Whisper, AllTalk)
+- Launcher for Claude Code terminals
 - Minimize to system tray
 """
 import ctypes
@@ -11,7 +14,6 @@ import ctypes.wintypes
 import io
 import json
 import logging
-import os
 import queue
 import re
 import socket
@@ -21,13 +23,16 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 import wave
+import webbrowser
 from tkinter import ttk, messagebox
 from pathlib import Path
 
 import numpy as np
 import requests
 import sounddevice as sd
+from tkwinterm.winterminal import Terminal
 
 try:
     import pystray
@@ -56,6 +61,20 @@ VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2  # 960 bytes (int16)
 LOG_FILE = Path("F:/Apps/freedom_system/log/claude_code_voice_mode_mic_panel.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+# Service management
+WHISPER_PORT = 8787
+ALLTALK_PORT = 7851
+WHISPER_HEALTH_PATH = "/health"
+ALLTALK_HEALTH_PATH = "/api/ready"
+WHISPER_CWD = r"F:\Apps\freedom_system\app_cabinet\whisper_stt"
+ALLTALK_CWD = r"F:\Apps\freedom_system\app_cabinet\alltalk_tts"
+REPOS_DIR = r"F:\Apps\freedom_system"
+
+# Panel dimensions
+PANEL_WIDTH_COLLAPSED = 280
+PANEL_WIDTH_EXPANDED = 1280
+PANEL_HEIGHT = 860
+
 LOG_FORMAT = "[MIC_PANEL] [%(levelname)s] %(message)s"
 logging.basicConfig(
     level=logging.INFO,
@@ -76,13 +95,14 @@ class TextHandler(logging.Handler):
 
     def emit(self, record):
         msg = self.format(record) + "\n"
-        self.text_widget.after(0, self._append, msg)
+        try:
+            self.text_widget.after(0, self._append, msg)
+        except RuntimeError:
+            pass  # main thread not in main loop yet
 
     def _append(self, msg):
-        self.text_widget.config(state=tk.NORMAL)
         self.text_widget.insert(tk.END, msg)
         self.text_widget.see(tk.END)
-        self.text_widget.config(state=tk.DISABLED)
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +149,78 @@ def create_tray_icon_image(color="green"):
     return img
 
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_URL_RE = re.compile(r'https?://\S+')
+
+
+def _make_readonly(text_widget):
+    """Block typing but allow navigation, selection, and copy."""
+    def _on_key(event):
+        # Allow Ctrl+C (copy), Ctrl+A (select all), navigation keys
+        if event.state & 0x4 and event.keysym in ("c", "C", "a", "A"):
+            return
+        if event.keysym in ("Up", "Down", "Left", "Right", "Home", "End",
+                            "Prior", "Next", "Shift_L", "Shift_R",
+                            "Control_L", "Control_R"):
+            return
+        return "break"
+    text_widget.bind("<Key>", _on_key)
+
+
+def _setup_link_tags(text_widget):
+    """Configure a Text widget to support clickable URL links.
+
+    Disabled Text widgets block tag_bind events, so we bind at
+    the widget level and check for the 'link' tag in the handler.
+    """
+    text_widget.tag_configure("link", foreground="#58a6ff", underline=True)
+    text_widget.bind("<Motion>", lambda e: _on_link_motion(text_widget, e))
+    text_widget.bind("<Button-1>", lambda e: _on_link_click(text_widget, e))
+
+
+def _on_link_motion(widget, event):
+    """Change cursor to hand when hovering over a link tag."""
+    idx = widget.index(f"@{event.x},{event.y}")
+    if "link" in widget.tag_names(idx):
+        widget.config(cursor="hand2")
+    else:
+        widget.config(cursor="xterm")
+
+
+def _on_link_click(widget, event):
+    """Open the URL under the mouse cursor in the default browser."""
+    idx = widget.index(f"@{event.x},{event.y}")
+    if "link" not in widget.tag_names(idx):
+        return
+    tag_range = widget.tag_prevrange("link", f"{idx}+1c")
+    if tag_range:
+        url = widget.get(*tag_range)
+        webbrowser.open(url)
+
+
+def _append_to_text_widget(widget, text):
+    """Thread-safe append to a tk.Text widget via .after()."""
+    def _do():
+        try:
+            start_idx = widget.index(tk.END)
+            text_clean = _ANSI_RE.sub('', text)
+            widget.insert(tk.END, text_clean)
+            # Tag any URLs in the just-inserted text
+            for m in _URL_RE.finditer(text_clean):
+                line_start = widget.index(f"{start_idx}+{m.start()}c")
+                line_end = widget.index(f"{start_idx}+{m.end()}c")
+                widget.tag_add("link", line_start, line_end)
+            widget.see(tk.END)
+        except Exception:
+            logger.exception("_append_to_text_widget error")
+    widget.after(0, _do)
+
+
 class MicControlPanel:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Claude Code Voice Mode Mic")
-        self.root.geometry("280x860")
+        self.root.geometry(f"{PANEL_WIDTH_COLLAPSED}x{PANEL_HEIGHT}")
         self.root.resizable(False, True)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -176,6 +263,14 @@ class MicControlPanel:
         self._vad_pre_buffer = []     # rolling buffer of last ~10 frames (300ms)
         self._vad_recording_frames = []  # accumulated 30ms byte chunks during speech
 
+        # Slide-out panel state
+        self._active_panel = None  # None, "settings", or "console"
+        self._pre_expand_x = None  # saved x position before expand (for correct collapse)
+
+        # Service subprocess handles
+        self._whisper_proc = None
+        self._alltalk_proc = None
+
         self._build_ui()
         self._setup_console_logging()
         self._update_state()
@@ -185,6 +280,12 @@ class MicControlPanel:
         if not self._selected_terminal.get():
             self.root.after(3000, self._refresh_terminals)
             self.root.after(8000, self._refresh_terminals)
+
+        # Auto-start services after UI is ready (non-blocking)
+        self.root.after(500, self._auto_start_services)
+
+        # Start with console panel open so service output is visible
+        self.root.after(100, lambda: self._toggle_panel("console"))
 
     def _query_input_devices(self):
         """Query available input devices, filtered to the default host API (MME on Windows)."""
@@ -211,10 +312,76 @@ class MicControlPanel:
                 return d["index"]
         return None
 
+    # -----------------------------------------------------------------------
+    # UI Building
+    # -----------------------------------------------------------------------
     def _build_ui(self):
-        """Build the tkinter UI."""
-        # Title ribbon (very top)
-        title_frame = tk.Frame(self.root, bg="#2b2b2b")
+        """Build the tkinter UI with slide-out tab system.
+        Layout: slide-out panel expands LEFT, mic controls stay on the RIGHT."""
+        # Main horizontal container
+        self._main_container = tk.Frame(self.root)
+        self._main_container.pack(fill=tk.BOTH, expand=True)
+
+        # Left side: slide-out panel (hidden by default, expands LEFT)
+        self._slideout_frame = tk.Frame(self._main_container)
+        # Not packed initially — shown when a tab is clicked
+
+        # Right side: mic panel controls (always visible)
+        self._controls_frame = tk.Frame(self._main_container, width=PANEL_WIDTH_COLLAPSED)
+        self._controls_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        self._controls_frame.pack_propagate(False)
+
+        # Build the tab bar at top of controls frame
+        self._build_tab_bar(self._controls_frame)
+
+        # Build mic controls in controls frame
+        self._build_mic_controls(self._controls_frame)
+
+        # Build slide-out panel contents (created but not shown)
+        self._settings_frame = tk.Frame(self._slideout_frame)
+        self._console_frame = tk.Frame(self._slideout_frame)
+        self._build_settings_panel()
+        self._build_console_panel()
+
+    def _build_tab_bar(self, parent):
+        """Build custom tab button row."""
+        tab_frame = tk.Frame(parent, bg="#1a1a2e")
+        tab_frame.pack(fill=tk.X)
+
+        btn_style = {
+            "font": ("Segoe UI", 8, "bold"),
+            "relief": tk.FLAT, "bd": 0, "padx": 6, "pady": 3,
+            "cursor": "hand2",
+        }
+
+        self._tab_mic = tk.Button(
+            tab_frame, text="Mic", bg="#16213e", fg="#e0e0e0",
+            activebackground="#0f3460", activeforeground="white",
+            command=lambda: self._toggle_panel(None),
+            **btn_style
+        )
+        self._tab_mic.pack(side=tk.LEFT, padx=(2, 1), pady=2)
+
+        self._tab_settings = tk.Button(
+            tab_frame, text="Settings", bg="#1a1a2e", fg="#888888",
+            activebackground="#0f3460", activeforeground="white",
+            command=lambda: self._toggle_panel("settings"),
+            **btn_style
+        )
+        self._tab_settings.pack(side=tk.LEFT, padx=1, pady=2)
+
+        self._tab_console = tk.Button(
+            tab_frame, text="Console", bg="#1a1a2e", fg="#888888",
+            activebackground="#0f3460", activeforeground="white",
+            command=lambda: self._toggle_panel("console"),
+            **btn_style
+        )
+        self._tab_console.pack(side=tk.LEFT, padx=1, pady=2)
+
+    def _build_mic_controls(self, parent):
+        """Build all mic panel controls in the given parent frame."""
+        # Title ribbon
+        title_frame = tk.Frame(parent, bg="#2b2b2b")
         title_frame.pack(fill=tk.X, padx=0, pady=0)
         tk.Label(
             title_frame, text="Claude Code Voice Mode", font=("Segoe UI", 12, "bold"),
@@ -223,7 +390,7 @@ class MicControlPanel:
 
         # Target Terminal selector
         terminal_frame = tk.LabelFrame(
-            self.root, text="Target Terminal", font=("Segoe UI", 9), padx=10, pady=5
+            parent, text="Target Terminal", font=("Segoe UI", 9), padx=10, pady=5
         )
         terminal_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
 
@@ -244,7 +411,7 @@ class MicControlPanel:
 
         # Input device selector
         device_frame = tk.LabelFrame(
-            self.root, text="Input Device", font=("Segoe UI", 9), padx=10, pady=5
+            parent, text="Input Device", font=("Segoe UI", 9), padx=10, pady=5
         )
         device_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
 
@@ -266,7 +433,7 @@ class MicControlPanel:
         self.device_refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
 
         # Status indicator
-        self.status_frame = tk.Frame(self.root, bg="#1e1e1e")
+        self.status_frame = tk.Frame(parent, bg="#1e1e1e")
         self.status_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
         self.status_label = tk.Label(
             self.status_frame, text="Muted", font=("Segoe UI", 10),
@@ -275,14 +442,14 @@ class MicControlPanel:
         self.status_label.pack()
 
         # Audio level meter
-        level_frame = tk.Frame(self.root)
+        level_frame = tk.Frame(parent)
         level_frame.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(level_frame, text="Level:", font=("Segoe UI", 9)).pack(side=tk.LEFT)
         self.level_bar = ttk.Progressbar(level_frame, length=200, mode="determinate", maximum=100)
         self.level_bar.pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
 
         # Mode selection
-        mode_frame = tk.LabelFrame(self.root, text="Mode", font=("Segoe UI", 9), padx=10, pady=5)
+        mode_frame = tk.LabelFrame(parent, text="Mode", font=("Segoe UI", 9), padx=10, pady=5)
         mode_frame.pack(fill=tk.X, padx=10, pady=5)
 
         tk.Radiobutton(
@@ -299,7 +466,7 @@ class MicControlPanel:
         self._update_mode_labels()
 
         # Main action button
-        btn_frame = tk.Frame(self.root)
+        btn_frame = tk.Frame(parent)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
 
         self.action_btn = tk.Button(
@@ -319,7 +486,7 @@ class MicControlPanel:
         self.mute_btn.pack(fill=tk.X, pady=(5, 0))
 
         # Volume slider
-        vol_frame = tk.LabelFrame(self.root, text="Mic Volume", font=("Segoe UI", 9), padx=10, pady=5)
+        vol_frame = tk.LabelFrame(parent, text="Mic Volume", font=("Segoe UI", 9), padx=10, pady=5)
         vol_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.vol_slider = tk.Scale(
@@ -330,7 +497,7 @@ class MicControlPanel:
         self.vol_slider.pack(fill=tk.X)
 
         # TTS Control
-        tts_frame = tk.LabelFrame(self.root, text="TTS Control", font=("Segoe UI", 9), padx=10, pady=5)
+        tts_frame = tk.LabelFrame(parent, text="TTS Control", font=("Segoe UI", 9), padx=10, pady=5)
         tts_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.tts_pause_btn = tk.Button(
@@ -340,24 +507,33 @@ class MicControlPanel:
         )
         self.tts_pause_btn.pack(fill=tk.X)
 
-        # Embedded console log
-        console_frame = tk.LabelFrame(self.root, text="Console", font=("Segoe UI", 9), padx=5, pady=5)
-        console_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # Three restart buttons in a row
+        restart_frame = tk.Frame(parent)
+        restart_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
+        restart_frame.columnconfigure(0, weight=1)
+        restart_frame.columnconfigure(1, weight=1)
+        restart_frame.columnconfigure(2, weight=1)
 
-        console_scroll = tk.Scrollbar(console_frame)
-        console_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Button(
+            restart_frame, text="Restart\nMic", font=("Segoe UI", 7, "bold"),
+            bg="#2196F3", fg="white", activebackground="#1976D2",
+            pady=2, command=self._restart
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 2))
 
-        self.console_text = tk.Text(
-            console_frame, height=8, font=("Consolas", 8),
-            bg="#1e1e1e", fg="#cccccc", insertbackground="#cccccc",
-            state=tk.DISABLED, wrap=tk.WORD,
-            yscrollcommand=console_scroll.set
-        )
-        self.console_text.pack(fill=tk.BOTH, expand=True)
-        console_scroll.config(command=self.console_text.yview)
+        tk.Button(
+            restart_frame, text="Restart\nWhisper", font=("Segoe UI", 7, "bold"),
+            bg="#2196F3", fg="white", activebackground="#1976D2",
+            pady=2, command=self._restart_whisper
+        ).grid(row=0, column=1, sticky="ew", padx=2)
+
+        tk.Button(
+            restart_frame, text="Restart\nAllTalk", font=("Segoe UI", 7, "bold"),
+            bg="#2196F3", fg="white", activebackground="#1976D2",
+            pady=2, command=self._restart_alltalk
+        ).grid(row=0, column=2, sticky="ew", padx=(2, 0))
 
         # Shutdown Services dropdown
-        shutdown_frame = tk.Frame(self.root)
+        shutdown_frame = tk.Frame(parent)
         shutdown_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
 
         self.shutdown_mb = tk.Menubutton(
@@ -374,18 +550,8 @@ class MicControlPanel:
         shutdown_menu.add_command(label="Close Whisper Only", command=self._shutdown_whisper)
         self.shutdown_mb.config(menu=shutdown_menu)
 
-        # Restart button
-        restart_frame = tk.Frame(self.root)
-        restart_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
-
-        tk.Button(
-            restart_frame, text="Restart Mic Panel", font=("Segoe UI", 9, "bold"),
-            bg="#2196F3", fg="white", activebackground="#1976D2",
-            padx=8, pady=4, command=self._restart
-        ).pack(fill=tk.X)
-
         # Bottom buttons
-        bottom_frame = tk.Frame(self.root)
+        bottom_frame = tk.Frame(parent)
         bottom_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
 
         if HAS_TRAY:
@@ -400,6 +566,516 @@ class MicControlPanel:
             padx=8, pady=4, command=self._quit
         ).pack(side=tk.RIGHT)
 
+    def _build_settings_panel(self):
+        """Build the Settings slide-out panel content."""
+        # Header
+        tk.Label(
+            self._settings_frame, text="Settings Guide",
+            font=("Segoe UI", 14, "bold"), fg="#e0e0e0", bg="#1e1e1e",
+            pady=10, padx=10, anchor="w"
+        ).pack(fill=tk.X)
+
+        # Scrollable content
+        canvas = tk.Canvas(self._settings_frame, bg="#1e1e1e", highlightthickness=0)
+        scrollbar = tk.Scrollbar(self._settings_frame, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg="#1e1e1e")
+
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Content
+        settings_text = """
+AllTalk TTS vs Claude Code Voice Mode Settings
+================================================
+
+These are TWO SEPARATE systems with their own settings.
+Changing one does NOT affect the other.
+
+TEMPERATURE
+-----------
+AllTalk Temperature:
+  - Controls TTS voice variation/expressiveness
+  - Set via AllTalk Gradio UI (port 7852) or confignew.json
+  - Range: 0.1 - 1.5 (default ~0.75)
+  - Higher = more varied/expressive speech
+
+Claude Code Voice Mode Temperature:
+  - Controls the MCP server's TTS generation temperature
+  - Set via the set_temperature MCP tool
+  - Affects how the voice sounds when Claude speaks
+  - Independent of AllTalk's own temperature setting
+
+VOICE SELECTION
+---------------
+AllTalk Voice:
+  - Set in AllTalk Gradio UI or via API
+  - Stored in AllTalk's own config
+
+Claude Code Voice Mode Voice:
+  - Set via the set_voice MCP tool (e.g., "Freya.wav")
+  - Passed to AllTalk API per-request
+  - Overrides AllTalk's default for Claude's speech
+
+SPEED
+-----
+AllTalk Speed:
+  - AllTalk doesn't have a native speed control
+  - Speed is determined by the TTS model
+
+Claude Code Voice Mode Speed:
+  - Set via the set_speed MCP tool
+  - Adjusts playback sample rate (0.5x to 2.0x)
+  - Post-processing, not model-level
+
+AUDIO DEVICE & VOLUME
+---------------------
+  - Input device: Set in the Mic tab (this panel)
+  - Volume: Set with the Mic Volume slider
+  - These are mic panel settings, not AllTalk settings
+
+TTS PAUSE
+---------
+  - "Pause TTS" button stops AllTalk mid-generation
+  - Uses AllTalk's /api/stop-generation endpoint
+  - Does not change any permanent settings
+"""
+        tk.Label(
+            scroll_frame, text=settings_text,
+            font=("Consolas", 9), fg="#cccccc", bg="#1e1e1e",
+            justify=tk.LEFT, anchor="nw", padx=15, pady=10,
+            wraplength=450
+        ).pack(fill=tk.X)
+
+    def _build_console_panel(self):
+        """Build the Console slide-out panel with 2x2 grid of live consoles."""
+        # 2x2 grid
+        self._console_frame.rowconfigure(0, weight=1)
+        self._console_frame.rowconfigure(1, weight=1)
+        self._console_frame.columnconfigure(0, weight=1)
+        self._console_frame.columnconfigure(1, weight=1)
+
+        # Top-left: Whisper STT (real terminal emulator)
+        whisper_lf = tk.LabelFrame(
+            self._console_frame, text="Whisper STT", font=("Segoe UI", 9, "bold"),
+            fg="#4fc3f7", padx=3, pady=3
+        )
+        whisper_lf.grid(row=0, column=0, sticky="nsew", padx=(5, 2), pady=(5, 2))
+
+        self._whisper_term = Terminal(whisper_lf, font_size=9)
+        self._whisper_term.pack(fill=tk.BOTH, expand=True)
+        self._whisper_term.text.config(bg="#0d1117", fg="#c9d1d9")
+
+        # Top-right: AllTalk TTS (real terminal emulator)
+        alltalk_lf = tk.LabelFrame(
+            self._console_frame, text="AllTalk TTS", font=("Segoe UI", 9, "bold"),
+            fg="#81c784", padx=3, pady=3
+        )
+        alltalk_lf.grid(row=0, column=1, sticky="nsew", padx=(2, 5), pady=(5, 2))
+
+        self._alltalk_term = Terminal(alltalk_lf, font_size=9)
+        self._alltalk_term.pack(fill=tk.BOTH, expand=True)
+        self._alltalk_term.text.config(bg="#0d1117", fg="#c9d1d9")
+
+        # Bottom-left: Mic Panel Log
+        mic_lf = tk.LabelFrame(
+            self._console_frame, text="Mic Panel Log", font=("Segoe UI", 9, "bold"),
+            fg="#ffb74d", padx=3, pady=3
+        )
+        mic_lf.grid(row=1, column=0, sticky="nsew", padx=(5, 2), pady=(2, 5))
+
+        mic_scroll = tk.Scrollbar(mic_lf)
+        mic_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.console_text = tk.Text(
+            mic_lf, font=("Consolas", 9), bg="#1e1e1e", fg="#cccccc",
+            insertbackground="#00ff00", insertwidth=2, wrap=tk.WORD,
+            yscrollcommand=mic_scroll.set
+        )
+        self.console_text.pack(fill=tk.BOTH, expand=True)
+        mic_scroll.config(command=self.console_text.yview)
+        _make_readonly(self.console_text)
+        _setup_link_tags(self.console_text)
+
+        # Bottom-right: Launcher
+        launcher_lf = tk.LabelFrame(
+            self._console_frame, text="Launcher", font=("Segoe UI", 9, "bold"),
+            fg="#ce93d8", padx=3, pady=3
+        )
+        launcher_lf.grid(row=1, column=1, sticky="nsew", padx=(2, 5), pady=(2, 5))
+
+        self._build_launcher_panel(launcher_lf)
+
+    def _build_launcher_panel(self, parent):
+        """Build the launcher panel: interactive repo list + New Terminal button."""
+        # Launcher console — editable so user sees a cursor
+        launcher_scroll = tk.Scrollbar(parent)
+        launcher_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._launcher_text = tk.Text(
+            parent, font=("Consolas", 9), bg="#1a1a2e", fg="#e0e0e0",
+            insertbackground="#00ff00", insertwidth=2, wrap=tk.WORD,
+            yscrollcommand=launcher_scroll.set
+        )
+        self._launcher_text.pack(fill=tk.BOTH, expand=True)
+        launcher_scroll.config(command=self._launcher_text.yview)
+
+        # Track available repos for number-key selection
+        self._launcher_repos = []
+
+        # Bind number keys and Enter for interactive repo selection
+        self._launcher_text.bind("<Return>", self._on_launcher_enter)
+        # Prevent most editing but allow number input at the prompt line
+        self._launcher_text.bind("<Key>", self._on_launcher_key)
+
+        # Button bar at bottom
+        btn_bar = tk.Frame(parent)
+        btn_bar.pack(fill=tk.X, pady=(3, 0))
+
+        self._repo_var = tk.StringVar()
+        self._repo_combo = ttk.Combobox(
+            btn_bar, textvariable=self._repo_var,
+            state="readonly", font=("Segoe UI", 8)
+        )
+        self._repo_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+
+        tk.Button(
+            btn_bar, text="New Terminal", font=("Segoe UI", 8, "bold"),
+            bg="#7c4dff", fg="white", activebackground="#651fff",
+            command=self._open_new_terminal
+        ).pack(side=tk.RIGHT)
+
+        # Populate repo list
+        self._refresh_repos()
+
+    def _on_launcher_key(self, event):
+        """Handle keystrokes in the launcher console.
+        Allow digits and backspace at the prompt line; block everything else."""
+        # Allow navigation keys
+        if event.keysym in ("Up", "Down", "Left", "Right", "Home", "End",
+                            "Prior", "Next"):  # PgUp, PgDn
+            return
+        # Allow digits and backspace on the prompt line
+        if event.char and (event.char.isdigit() or event.keysym == "BackSpace"):
+            # Only allow editing on the last line (prompt line)
+            cursor_line = int(self._launcher_text.index(tk.INSERT).split(".")[0])
+            last_line = int(self._launcher_text.index(tk.END + "-1c").split(".")[0])
+            if cursor_line == last_line:
+                return  # allow the keystroke
+        # Block all other input
+        return "break"
+
+    def _on_launcher_enter(self, event):
+        """Handle Enter in launcher console: open terminal for the typed number."""
+        # Get text on the current (last) line after the prompt
+        last_line = self._launcher_text.index(tk.END + "-1c").split(".")[0]
+        line_text = self._launcher_text.get(f"{last_line}.0", f"{last_line}.end").strip()
+
+        # Extract trailing digits (the user's choice)
+        digits = ""
+        for ch in reversed(line_text):
+            if ch.isdigit():
+                digits = ch + digits
+            else:
+                break
+
+        if not digits:
+            return "break"
+
+        choice = int(digits)
+        if 1 <= choice <= len(self._launcher_repos):
+            repo_dir = self._launcher_repos[choice - 1]
+            self._repo_var.set(repo_dir)
+            self._launcher_text.insert(tk.END, "\n")
+            self._open_new_terminal()
+        else:
+            self._launcher_text.insert(tk.END, f"\n  Invalid choice: {choice}\n")
+            self._show_launcher_prompt()
+
+        return "break"
+
+    def _show_launcher_prompt(self):
+        """Show the input prompt at the bottom of the launcher console."""
+        self._launcher_text.insert(tk.END, f"Enter choice (1-{len(self._launcher_repos)}): ")
+        self._launcher_text.see(tk.END)
+        self._launcher_text.mark_set(tk.INSERT, tk.END)
+
+    def _refresh_repos(self):
+        """Scan REPOS_DIR for REPO_* directories and update the dropdown."""
+        repos = []
+        repos_path = Path(REPOS_DIR)
+        if repos_path.exists():
+            repos.append(str(repos_path))  # Parent dir
+            for d in sorted(repos_path.iterdir()):
+                if d.is_dir() and d.name.startswith("REPO_"):
+                    repos.append(str(d))
+
+        self._launcher_repos = repos
+        self._repo_combo['values'] = repos
+        if repos:
+            default = repos[1] if len(repos) > 1 else repos[0]
+            self._repo_var.set(default)
+
+        # Show interactive menu in launcher console
+        self._launcher_text.insert(tk.END, "========================================\n")
+        self._launcher_text.insert(tk.END, " Select working directory:\n")
+        self._launcher_text.insert(tk.END, "========================================\n\n")
+        for i, r in enumerate(repos, 1):
+            name = Path(r).name
+            self._launcher_text.insert(tk.END, f"  {i}. {name}\n")
+        self._launcher_text.insert(tk.END, "\n")
+        self._show_launcher_prompt()
+
+    def _open_new_terminal(self):
+        """Open a new Claude Code terminal for the selected repo."""
+        repo_dir = self._repo_var.get()
+        if not repo_dir:
+            return
+
+        folder_name = Path(repo_dir).name
+
+        # Find first available instance number (01-99)
+        try:
+            result = subprocess.run(
+                ['wmic', 'process', 'where', "name='cmd.exe'", 'get', 'commandline'],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            wmic_dump = result.stdout
+        except Exception:
+            wmic_dump = ""
+
+        next_num = "01"
+        for i in range(1, 100):
+            test_num = f"{i:02d}"
+            if f"title {folder_name}_{test_num}" not in wmic_dump.lower():
+                next_num = test_num
+                break
+
+        terminal_name = f"{folder_name}_{next_num}"
+
+        cmd = (
+            f'cmd /k "title {terminal_name} && cd /d {repo_dir} && echo. '
+            f'&& echo  Claude Code Voice Mode is ready. '
+            f'&& echo  Terminal: {terminal_name} '
+            f'&& echo  AllTalk TTS: http://127.0.0.1:{ALLTALK_PORT} '
+            f'&& echo  Whisper STT: http://127.0.0.1:{WHISPER_PORT} '
+            f'&& echo. && echo  Type your commands below. && echo."'
+        )
+
+        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+        _append_to_text_widget(self._launcher_text,
+            f"Opening Terminal in: {repo_dir}\n"
+            f" Terminal name: {terminal_name}\n\n"
+        )
+        logger.info(f"Opened new terminal: {terminal_name} in {repo_dir}")
+
+        # Refresh terminal list after a short delay
+        self.root.after(2000, self._refresh_terminals)
+
+    # -----------------------------------------------------------------------
+    # Slide-out Panel System
+    # -----------------------------------------------------------------------
+    def _toggle_panel(self, panel_name):
+        """Toggle a slide-out panel. None = collapse to mic only.
+        Panels expand to the LEFT by shifting the window position."""
+        expand_delta = PANEL_WIDTH_EXPANDED - PANEL_WIDTH_COLLAPSED
+
+        if panel_name is None or self._active_panel == panel_name:
+            # Collapse: restore to saved pre-expand position
+            self._active_panel = None
+            self._slideout_frame.pack_forget()
+            self._settings_frame.pack_forget()
+            self._console_frame.pack_forget()
+            self.root.update_idletasks()
+            y = self.root.winfo_y()
+            restore_x = self._pre_expand_x if self._pre_expand_x is not None else self.root.winfo_x() + expand_delta
+            self._pre_expand_x = None
+            self.root.geometry(f"{PANEL_WIDTH_COLLAPSED}x{PANEL_HEIGHT}+{restore_x}+{y}")
+            self._update_tab_highlight()
+            return
+
+        # If already expanded with a different panel, just switch content (no position change)
+        was_expanded = self._active_panel is not None
+
+        # Expand
+        self._active_panel = panel_name
+        self._settings_frame.pack_forget()
+        self._console_frame.pack_forget()
+
+        if panel_name == "settings":
+            self._settings_frame.pack(fill=tk.BOTH, expand=True)
+        elif panel_name == "console":
+            self._console_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._slideout_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        if not was_expanded:
+            # Save current position for correct collapse, then shift LEFT
+            self.root.update_idletasks()
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            self._pre_expand_x = x  # save for collapse
+            new_x = max(0, x - expand_delta)
+            self.root.geometry(f"{PANEL_WIDTH_EXPANDED}x{PANEL_HEIGHT}+{new_x}+{y}")
+        else:
+            self.root.geometry(f"{PANEL_WIDTH_EXPANDED}x{PANEL_HEIGHT}")
+        self._update_tab_highlight()
+
+    def _update_tab_highlight(self):
+        """Update tab button colors to show active state."""
+        inactive = {"bg": "#1a1a2e", "fg": "#888888"}
+        active = {"bg": "#16213e", "fg": "#e0e0e0"}
+
+        self._tab_mic.config(**(active if self._active_panel is None else inactive))
+        self._tab_settings.config(**(active if self._active_panel == "settings" else inactive))
+        self._tab_console.config(**(active if self._active_panel == "console" else inactive))
+
+    # -----------------------------------------------------------------------
+    # Service Process Management
+    # -----------------------------------------------------------------------
+    def _is_service_running(self, port, health_path):
+        """Check if a service is already running by hitting its health endpoint."""
+        try:
+            resp = requests.get(f"http://127.0.0.1:{port}{health_path}", timeout=0.5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _auto_start_services(self):
+        """Auto-start Whisper and AllTalk if not already running.
+        Boot sequence: launcher console (already populated) → Whisper → AllTalk.
+        Runs detection in a background thread to avoid blocking UI."""
+        logger.info("Auto-start services triggered")
+        def _do_auto_start():
+            try:
+                # Check and start Whisper
+                if self._is_service_running(WHISPER_PORT, WHISPER_HEALTH_PATH):
+                    logger.info("Whisper STT already running — skipping auto-start")
+                else:
+                    logger.info("Whisper STT not running — auto-starting...")
+                    self.root.after(0, self._start_whisper)
+                    # Wait for Whisper to be ready before starting AllTalk
+                    self._wait_for_service_ready(WHISPER_PORT, WHISPER_HEALTH_PATH, timeout=60)
+
+                # Check and start AllTalk
+                if self._is_service_running(ALLTALK_PORT, ALLTALK_HEALTH_PATH):
+                    logger.info("AllTalk TTS already running — skipping auto-start")
+                else:
+                    logger.info("AllTalk TTS not running — auto-starting...")
+                    self.root.after(0, self._start_alltalk)
+            except Exception:
+                logger.exception("Auto-start services failed")
+
+        threading.Thread(target=_do_auto_start, daemon=True).start()
+
+    def _start_whisper(self):
+        """Start Whisper STT via the embedded terminal emulator."""
+        if self._whisper_proc:
+            logger.info("Whisper already running via terminal")
+            return
+        cmd = f'cd /d {WHISPER_CWD} && call venv\\Scripts\\activate.bat && python server.py\r\n'
+        logger.info(f"Launching Whisper STT: {cmd.strip()}")
+        self._whisper_term.winpty.send_command(cmd)
+        self._whisper_proc = True  # Mark as running (PTY manages the process)
+
+    def _start_alltalk(self):
+        """Start AllTalk TTS via the embedded terminal emulator."""
+        if self._alltalk_proc:
+            logger.info("AllTalk already running via terminal")
+            return
+        cmd = f'cd /d {ALLTALK_CWD} && call start_alltalk.bat\r\n'
+        logger.info(f"Launching AllTalk TTS: {cmd.strip()}")
+        self._alltalk_term.winpty.send_command(cmd)
+        self._alltalk_proc = True  # Mark as running (PTY manages the process)
+
+    def _wait_for_service_ready(self, port, health_path, timeout=60):
+        """Poll a service's health endpoint until it responds 200, or timeout."""
+        url = f"http://127.0.0.1:{port}{health_path}"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = requests.get(url, timeout=2)
+                if resp.status_code == 200:
+                    logger.info(f"Service on port {port} is ready")
+                    return True
+            except requests.ConnectionError:
+                pass
+            except Exception as e:
+                logger.warning(f"Health check for port {port} failed: {e}")
+            time.sleep(2)
+        logger.warning(f"Service on port {port} did not become ready within {timeout}s")
+        return False
+
+    def _kill_service_on_port(self, port, service_name):
+        """Kill whatever is running on the given port."""
+        pid = self._find_pid_on_port(port)
+        if pid:
+            logger.info(f"Killing {service_name} (PID {pid}) on port {port}")
+            try:
+                subprocess.run(
+                    ['taskkill', '/pid', str(pid), '/t', '/f'],
+                    capture_output=True, stdin=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            except Exception as e:
+                logger.error(f"Failed to kill {service_name}: {e}")
+            # Also kill our subprocess handle if we have one
+            time.sleep(1)
+
+    def _restart_whisper(self):
+        """Restart Whisper STT: kill existing service and relaunch via terminal."""
+        def do_restart():
+            logger.info("Restarting Whisper STT...")
+            self.root.after(0, self._set_status, "Restarting Whisper...", "#ffcc00")
+
+            # Kill existing service on the port
+            self._kill_service_on_port(WHISPER_PORT, "Whisper STT")
+            self._whisper_proc = None  # Reset so _start_whisper will run
+            time.sleep(2)
+
+            # Send Ctrl+C to the terminal PTY to stop any running command, then relaunch
+            self._whisper_term.winpty.send_command('\x03\r\n')
+            time.sleep(1)
+            self._start_whisper()
+            if self._wait_for_service_ready(WHISPER_PORT, WHISPER_HEALTH_PATH, timeout=30):
+                logger.info("Whisper STT restarted successfully")
+                self.root.after(0, self._set_status, "Whisper restarted", "#00cc00")
+            else:
+                self.root.after(0, self._set_status, "Whisper not responding", "#ff4444")
+            self.root.after(3000, self._reset_status_if_idle)
+
+        threading.Thread(target=do_restart, daemon=True).start()
+
+    def _restart_alltalk(self):
+        """Restart AllTalk TTS: kill existing service and relaunch via terminal."""
+        def do_restart():
+            logger.info("Restarting AllTalk TTS...")
+            self.root.after(0, self._set_status, "Restarting AllTalk...", "#ffcc00")
+
+            # Kill existing service on the port
+            self._kill_service_on_port(ALLTALK_PORT, "AllTalk TTS")
+            self._alltalk_proc = None  # Reset so _start_alltalk will run
+            time.sleep(2)
+
+            # Send Ctrl+C to the terminal PTY to stop any running command, then relaunch
+            self._alltalk_term.winpty.send_command('\x03\r\n')
+            time.sleep(1)
+            self._start_alltalk()
+            if self._wait_for_service_ready(ALLTALK_PORT, ALLTALK_HEALTH_PATH, timeout=60):
+                logger.info("AllTalk TTS restarted successfully")
+                self.root.after(0, self._set_status, "AllTalk restarted", "#00cc00")
+            else:
+                self.root.after(0, self._set_status, "AllTalk not responding", "#ff4444")
+            self.root.after(3000, self._reset_status_if_idle)
+
+        threading.Thread(target=do_restart, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # Mode, device, recording handlers (unchanged from original)
+    # -----------------------------------------------------------------------
     def _on_mode_change(self):
         """Handle mode radio button change."""
         mode = self.mode.get()
@@ -990,11 +1666,7 @@ class MicControlPanel:
             self.root.after(3000, self._reset_status_if_idle)
 
     def _start_level_monitor(self):
-        """Start a background thread with a shared InputStream for level metering AND recording.
-
-        One persistent stream avoids Bluetooth conflicts from opening multiple
-        concurrent InputStreams on the same device.
-        """
+        """Start a background thread with a shared InputStream for level metering AND recording."""
         stop_event = self._level_monitor_stop
         device_index = self._get_selected_device_index()
         device_name = self.selected_device.get()
@@ -1061,6 +1733,9 @@ class MicControlPanel:
             self._meter_updater_started = True
             self.root.after(50, update_meter)
 
+    # -----------------------------------------------------------------------
+    # System tray
+    # -----------------------------------------------------------------------
     def _minimize_to_tray(self):
         """Hide window and show system tray icon."""
         if not HAS_TRAY:
@@ -1101,6 +1776,9 @@ class MicControlPanel:
         else:
             self._quit()
 
+    # -----------------------------------------------------------------------
+    # Service shutdown helpers
+    # -----------------------------------------------------------------------
     def _find_pid_on_port(self, port):
         """Find the PID of the process listening on the given port."""
         try:
@@ -1117,8 +1795,7 @@ class MicControlPanel:
         return None
 
     def _find_console_ancestor_pid(self, pid):
-        """Walk up the process tree (max 5 levels) to find the ancestor cmd.exe.
-        Returns (cmd_pid, 'cmd.exe') or (None, None) if not found."""
+        """Walk up the process tree (max 5 levels) to find the ancestor cmd.exe."""
         current_pid = str(pid)
         for _ in range(5):
             try:
@@ -1161,10 +1838,10 @@ class MicControlPanel:
         return None, None
 
     def _attach_and_send_ctrl_c(self, pid):
-        """Attach to a process's console and send Ctrl+C. Returns True if attached (caller must FreeConsole)."""
+        """Attach to a process's console and send Ctrl+C."""
         kernel32 = ctypes.windll.kernel32
 
-        # Detach from any previous console first (important when shutting down multiple services)
+        # Detach from any previous console first
         kernel32.FreeConsole()
 
         if not kernel32.AttachConsole(int(pid)):
@@ -1286,8 +1963,6 @@ class MicControlPanel:
             # Wait for the port to become free (server shutting down gracefully)
             if self._wait_for_port_free(port, timeout):
                 logger.info(f"{service_name} shut down gracefully")
-                # Server is down. The "Terminate batch job (Y/N)?" prompt may be showing now.
-                # Send "y" + Enter while still attached to the console.
                 time.sleep(1)
                 self._write_console_keys("y\r")
                 time.sleep(0.5)
@@ -1347,6 +2022,9 @@ class MicControlPanel:
 
         threading.Thread(target=shutdown_all, daemon=True).start()
 
+    # -----------------------------------------------------------------------
+    # Lifecycle
+    # -----------------------------------------------------------------------
     def _restart(self):
         """Restart the mic panel with updated code."""
         logger.info("Restarting mic panel...")
@@ -1364,6 +2042,12 @@ class MicControlPanel:
         """Clean shutdown."""
         logger.info("Mic panel shutting down")
         self._level_monitor_stop.set()
+        # Close embedded terminal emulators (shuts down their WinPTY processes)
+        for term in (self._whisper_term, self._alltalk_term):
+            try:
+                term.destroy()
+            except Exception:
+                pass
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.destroy()
@@ -1376,4 +2060,9 @@ class MicControlPanel:
 
 if __name__ == "__main__":
     panel = MicControlPanel()
+    # Redirect tkinter callback errors to log (pythonw.exe has no stderr)
+    panel.root.report_callback_exception = lambda exc_type, exc_value, exc_tb: (
+        logger.error("Tkinter callback error:\n"
+                     + "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    )
     panel.run()
