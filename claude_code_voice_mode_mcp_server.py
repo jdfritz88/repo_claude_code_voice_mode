@@ -30,7 +30,7 @@ from mcp.types import TextContent, Tool
 ALLTALK_URL = "http://127.0.0.1:7851"
 WHISPER_URL = "http://127.0.0.1:8787"
 DEFAULT_VOICE = "Freya.wav"
-PLAYBACK_SPEED = 1.0  # 0.5 = half speed, 1.0 = normal, 2.0 = double speed
+PLAYBACK_SPEED = 1.15  # 0.5 = half speed, 1.0 = normal, 2.0 = double speed
 SAMPLE_RATE = 16000
 CHANNELS = 1
 VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive filtering
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # Global state
 # ---------------------------------------------------------------------------
 current_voice = DEFAULT_VOICE
-current_speed = 1.0  # Playback speed (0.5-2.0)
+current_speed = PLAYBACK_SPEED  # Playback speed (0.5-2.0)
 current_temperature = 1.1  # TTS generation temperature (0.1-1.5)
 mic_muted = False
 _streaming_available: Optional[bool] = None  # None = not yet checked
