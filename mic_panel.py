@@ -58,7 +58,10 @@ VAD_PRE_BUFFER_MS = 300        # milliseconds of pre-roll audio to keep
 VAD_MIN_RECORDING_S = 0.5      # minimum recording length to process
 VAD_FRAME_SAMPLES = 480        # 30ms at 16kHz — required by webrtcvad
 VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2  # 960 bytes (int16)
-LOG_FILE = Path("F:/Apps/freedom_system/log/claude_code_voice_mode_mic_panel.log")
+# Logs live in this repo's own logs/ folder, derived from this file's location
+# so the path follows the repo rather than being pinned to a drive letter.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_FILE = LOG_DIR / "claude_code_voice_mode_mic_panel.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # Service management

@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 
 PROJECT_DIR = r"F:\Apps\freedom_system\REPO_claude_code_voice_mode"
-FALLBACK_LOG = Path(r"F:\Apps\freedom_system\log\claude_code_voice_mode.log")
+FALLBACK_LOG = Path(PROJECT_DIR) / "logs" / "claude_code_voice_mode.log"
 
 
 def _log_failure(stage: str, exc: Exception):

@@ -37,7 +37,10 @@ VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive filtering
 STREAMING_CHUNK_SIZE = 4096  # bytes per iter_content chunk
 WAV_HEADER_SIZE = 44  # standard WAV header
 
-LOG_FILE = Path("F:/Apps/freedom_system/log/claude_code_voice_mode.log")
+# Logs live in this repo's own logs/ folder, derived from this file's location
+# so the path follows the repo rather than being pinned to a drive letter.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_FILE = LOG_DIR / "claude_code_voice_mode.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
