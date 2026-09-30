@@ -37,3 +37,16 @@
 | 4 | Added TextHandler.emit try/except | Added but not verified |
 | 5 | CP1 subagent said "test agent left faked stubs, code is clean now" | UNVERIFIED |
 | 6 | Reduced _is_service_running timeout to 0.5s | Not verified |
+
+## Bug: Mic panel process never exits after "Close All" / Quit; terminal panes blank (2026-09-30)
+
+### Solutions Already Tried (DO NOT REPEAT)
+
+| # | Solution | Result |
+|---|----------|--------|
+| 1 | Remove the on-screen log handler in `_quit` / `_restart` just before `root.destroy()` | NOT FIXED - the audio thread was already inside the handler's Tk call when it was removed |
+| 2 | `TextHandler` puts lines on a `queue.Queue`; the window thread drains it every 100 ms (`_poll`), so no other thread ever calls Tk | FIXED - panel exits ~6 s after Close All (tested twice); Whisper/AllTalk panes now show their text |
+
+### Known Facts
+- `faulthandler` dump of the stuck process: audio `monitor` thread blocked in `tkinter.after()` inside `TextHandler.emit` (logging "Shared audio stream closed"); main thread blocked in `logging.shutdown` waiting for that handler's lock.
+- A Tk call from a non-window thread waits for the window thread to run it; once the window is closing, it never does.
