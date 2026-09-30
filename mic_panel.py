@@ -71,6 +71,16 @@ WHISPER_HEALTH_PATH = "/health"
 ALLTALK_HEALTH_PATH = "/api/ready"
 WHISPER_CWD = r"F:\Apps\freedom_system\app_cabinet\whisper_stt"
 ALLTALK_CWD = r"F:\Apps\freedom_system\app_cabinet\alltalk_tts"
+# AllTalk is started through REPO_alltalk (2026-09-25) so it runs with the Freedom
+# changes, settings and voices kept in that repo; its app folder stays stock.
+ALLTALK_LAUNCHER = r"F:\Apps\freedom_system\REPO_alltalk\launch_alltalk.bat"
+# AllTalk's graphics card (CUDA) / main processor (CPU) mode belongs to that .bat
+# (2026-09-30). Writing the saved mode is how any app switches: the .bat running
+# AllTalk sees the change and restarts it. A "restart" request works the same way.
+ALLTALK_MODE_FILE = r"F:\Apps\freedom_system\REPO_alltalk\settings\device_mode.txt"
+ALLTALK_RUNNING_MODE_FILE = r"F:\Apps\freedom_system\REPO_alltalk\runtime\running_mode.txt"
+ALLTALK_PID_FILE = r"F:\Apps\freedom_system\REPO_alltalk\runtime\alltalk.pid"
+ALLTALK_REQUEST_FILE = r"F:\Apps\freedom_system\REPO_alltalk\runtime\request.txt"
 REPOS_DIR = r"F:\Apps\freedom_system"
 
 # Panel dimensions
@@ -90,18 +100,32 @@ logger = logging.getLogger(__name__)
 
 
 class TextHandler(logging.Handler):
-    """Logging handler that writes to a tkinter Text widget (thread-safe)."""
+    """Logging handler that writes to a tkinter Text widget (thread-safe).
+
+    Other threads only put lines on a queue; the window's own thread takes them off.
+    Calling into Tk from another thread waits for the window to answer, and while
+    the window is closing it never does - the audio thread's last log line then hung
+    it forever, and the panel's process could not exit (seen 2026-09-30)."""
 
     def __init__(self, text_widget):
         super().__init__()
         self.text_widget = text_widget
+        self._lines = queue.Queue()
+        self._poll()
 
     def emit(self, record):
-        msg = self.format(record) + "\n"
+        self._lines.put(self.format(record) + "\n")
+
+    def _poll(self):
         try:
-            self.text_widget.after(0, self._append, msg)
-        except RuntimeError:
-            pass  # main thread not in main loop yet
+            while True:
+                self._append(self._lines.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            self.text_widget.after(100, self._poll)
+        except tk.TclError:
+            pass  # window is gone
 
     def _append(self, msg):
         self.text_widget.insert(tk.END, msg)
@@ -150,6 +174,57 @@ def create_tray_icon_image(color="green"):
     fill = colors.get(color, colors["gray"])
     draw.ellipse([4, 4, 60, 60], fill=fill, outline=(255, 255, 255, 255), width=2)
     return img
+
+
+def _alltalk_mode_label(mode):
+    return "main processor (CPU)" if mode == "cpu" else "graphics card (CUDA)"
+
+
+def _alltalk_saved_mode():
+    try:
+        with open(ALLTALK_MODE_FILE, encoding="utf-8") as f:
+            return "cpu" if f.read().strip().lower() == "cpu" else "cuda"
+    except OSError:
+        return "cuda"
+
+
+def _write_alltalk_file(path, word):
+    # CRLF: launch_alltalk.bat reads these
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write(word + "\n")
+
+
+def _process_exe(pid):
+    """Full path of a running process's program, or "" if it is not running."""
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_ulong(len(buf))
+        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _alltalk_running():
+    """(mode, pid) of the AllTalk that launch_alltalk.bat is running, or (None, None).
+
+    The .bat cannot tidy its runtime files when it is stopped from outside, so the
+    pid is only believed while it is still AllTalk's own python."""
+    try:
+        with open(ALLTALK_RUNNING_MODE_FILE, encoding="utf-8") as f:
+            mode = f.read().strip().lower()
+        with open(ALLTALK_PID_FILE, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None, None
+    if "alltalk_environment" not in _process_exe(pid).lower():
+        return None, None
+    return ("cpu" if mode == "cpu" else "cuda"), pid
 
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
@@ -534,6 +609,20 @@ class MicControlPanel:
             bg="#2196F3", fg="white", activebackground="#1976D2",
             pady=2, command=self._restart_alltalk
         ).grid(row=0, column=2, sticky="ew", padx=(2, 0))
+
+        # AllTalk mode: graphics card (CUDA) or main processor (CPU)
+        mode_frame = tk.Frame(parent)
+        mode_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
+        self._alltalk_switching = False
+        self._alltalk_mode_label = tk.Label(mode_frame, text="AllTalk: ...", font=("Segoe UI", 8), anchor="w")
+        self._alltalk_mode_label.pack(fill=tk.X)
+        self._alltalk_mode_btn = tk.Button(
+            mode_frame, text="Switch AllTalk mode", font=("Segoe UI", 8, "bold"),
+            bg="#2196F3", fg="white", activebackground="#1976D2",
+            pady=2, command=self._switch_alltalk_mode
+        )
+        self._alltalk_mode_btn.pack(fill=tk.X)
+        self.root.after(500, self._refresh_alltalk_mode)
 
         # Shutdown Services dropdown
         shutdown_frame = tk.Frame(parent)
@@ -989,7 +1078,7 @@ TTS PAUSE
         if self._alltalk_proc:
             logger.info("AllTalk already running via terminal")
             return
-        cmd = f'cd /d {ALLTALK_CWD} && call start_alltalk.bat\r\n'
+        cmd = f'call "{ALLTALK_LAUNCHER}"\r\n'
         logger.info(f"Launching AllTalk TTS: {cmd.strip()}")
         self._alltalk_term.winpty.send_command(cmd)
         self._alltalk_proc = True  # Mark as running (PTY manages the process)
@@ -1052,8 +1141,93 @@ TTS PAUSE
 
         threading.Thread(target=do_restart, daemon=True).start()
 
+    def _refresh_alltalk_mode(self):
+        """Keep the AllTalk mode line and switch button current (every 3 s)."""
+        try:
+            running, _ = _alltalk_running()
+            saved = _alltalk_saved_mode()
+            if self._alltalk_switching:
+                text = f"AllTalk: switching to the {_alltalk_mode_label(saved)} ..."
+            elif running:
+                text = f"AllTalk: on the {_alltalk_mode_label(running)}"
+            else:
+                text = f"AllTalk: not running (saved: {_alltalk_mode_label(saved)})"
+            target = "cuda" if (running or saved) == "cpu" else "cpu"
+            self._alltalk_mode_label.config(text=text)
+            self._alltalk_mode_btn.config(
+                text=f"Switch AllTalk to {_alltalk_mode_label(target)}",
+                state=tk.DISABLED if self._alltalk_switching else tk.NORMAL)
+        except Exception:
+            logger.exception("AllTalk mode refresh failed")
+        self.root.after(3000, self._refresh_alltalk_mode)
+
+    def _wait_for_alltalk_back(self, old_pid, mode=None, timeout=240):
+        """After launch_alltalk.bat restarts AllTalk: True once the new one is up."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            running, pid = _alltalk_running()
+            if running and pid != old_pid and (mode is None or running == mode) \
+                    and self._is_service_running(ALLTALK_PORT, ALLTALK_HEALTH_PATH):
+                return True
+            time.sleep(2)
+        return False
+
+    def _switch_alltalk_mode(self):
+        """Flip AllTalk between the graphics card and the main processor.
+
+        Only the saved mode is written; launch_alltalk.bat, wherever it runs AllTalk,
+        sees it and restarts AllTalk in the new mode."""
+        running, old_pid = _alltalk_running()
+        new = "cuda" if (running or _alltalk_saved_mode()) == "cpu" else "cpu"
+        _write_alltalk_file(ALLTALK_MODE_FILE, new)
+        label = _alltalk_mode_label(new)
+        logger.info(f"AllTalk mode set to {new} (running: {running})")
+        if not running:
+            if self._is_service_running(ALLTALK_PORT, ALLTALK_HEALTH_PATH):
+                self._set_status("AllTalk not started by its .bat - mode applies next start", "#ffcc00")
+            else:
+                self._set_status(f"Saved: AllTalk will start on the {label}", "#00cc00")
+            self.root.after(4000, self._reset_status_if_idle)
+            self._refresh_alltalk_mode()
+            return
+
+        self._alltalk_switching = True
+        self._set_status(f"Switching AllTalk to the {label}...", "#ffcc00")
+
+        def wait():
+            ok = self._wait_for_alltalk_back(old_pid, new)
+            self._alltalk_switching = False
+            if ok:
+                logger.info(f"AllTalk is back on the {label}")
+                self.root.after(0, self._set_status, f"AllTalk on the {label}", "#00cc00")
+            else:
+                logger.warning("AllTalk did not come back after the mode switch")
+                self.root.after(0, self._set_status, "AllTalk not responding", "#ff4444")
+            self.root.after(3000, self._reset_status_if_idle)
+
+        threading.Thread(target=wait, daemon=True).start()
+
     def _restart_alltalk(self):
-        """Restart AllTalk TTS: kill existing service and relaunch via terminal."""
+        """Restart AllTalk TTS.
+
+        When launch_alltalk.bat is running it, the .bat restarts it on request (in the
+        same mode); otherwise kill it and relaunch via the terminal."""
+        running, old_pid = _alltalk_running()
+        if running:
+            def do_request():
+                logger.info("Asking launch_alltalk.bat to restart AllTalk...")
+                self.root.after(0, self._set_status, "Restarting AllTalk...", "#ffcc00")
+                _write_alltalk_file(ALLTALK_REQUEST_FILE, "restart")
+                if self._wait_for_alltalk_back(old_pid):
+                    logger.info("AllTalk TTS restarted successfully")
+                    self.root.after(0, self._set_status, "AllTalk restarted", "#00cc00")
+                else:
+                    self.root.after(0, self._set_status, "AllTalk not responding", "#ff4444")
+                self.root.after(3000, self._reset_status_if_idle)
+
+            threading.Thread(target=do_request, daemon=True).start()
+            return
+
         def do_restart():
             logger.info("Restarting AllTalk TTS...")
             self.root.after(0, self._set_status, "Restarting AllTalk...", "#ffcc00")
@@ -2000,11 +2174,26 @@ TTS PAUSE
 
         logger.info(f"{service_name} shutdown complete")
 
+    def _stop_alltalk(self):
+        """Stop AllTalk. When launch_alltalk.bat is running it, ask the .bat to stop
+        it (the .bat closes AllTalk and exits); otherwise the Ctrl+C shutdown."""
+        running, _ = _alltalk_running()
+        if running:
+            logger.info("Asking launch_alltalk.bat to stop AllTalk...")
+            _write_alltalk_file(ALLTALK_REQUEST_FILE, "stop")
+            if self._wait_for_port_free(ALLTALK_PORT, 30):
+                self._alltalk_proc = None
+                logger.info("AllTalk TTS shutdown complete")
+                return
+            logger.warning("AllTalk did not stop on request - using the Ctrl+C shutdown")
+        self._graceful_shutdown_service(ALLTALK_PORT, "AllTalk TTS")
+        self._alltalk_proc = None
+
     def _shutdown_alltalk(self):
         """Gracefully shut down AllTalk TTS and its console window."""
         if not messagebox.askyesno("Confirm", "Close AllTalk TTS server and its console?"):
             return
-        threading.Thread(target=self._graceful_shutdown_service, args=(7851, "AllTalk TTS"), daemon=True).start()
+        threading.Thread(target=self._stop_alltalk, daemon=True).start()
 
     def _shutdown_whisper(self):
         """Gracefully shut down Whisper STT and its console window."""
@@ -2018,7 +2207,7 @@ TTS PAUSE
             return
 
         def shutdown_all():
-            self._graceful_shutdown_service(7851, "AllTalk TTS")
+            self._stop_alltalk()
             self._graceful_shutdown_service(8787, "Whisper STT")
             logger.info("All services shut down — closing mic panel")
             self.root.after(0, self._quit)
