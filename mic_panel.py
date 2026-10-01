@@ -176,14 +176,23 @@ def create_tray_icon_image(color="green"):
     return img
 
 
+ALLTALK_MODES = ("cuda", "cpu", "cpu_stream")   # launch_alltalk.bat's three modes
+
+
+def _alltalk_mode(word):
+    word = (word or "").strip().lower()
+    return word if word in ALLTALK_MODES else "cuda"
+
+
 def _alltalk_mode_label(mode):
-    return "main processor (CPU)" if mode == "cpu" else "graphics card (CUDA)"
+    return {"cpu": "main processor (CPU) without streaming",
+            "cpu_stream": "main processor (CPU) with streaming"}.get(mode, "graphics card (CUDA)")
 
 
 def _alltalk_saved_mode():
     try:
         with open(ALLTALK_MODE_FILE, encoding="utf-8") as f:
-            return "cpu" if f.read().strip().lower() == "cpu" else "cuda"
+            return _alltalk_mode(f.read())
     except OSError:
         return "cuda"
 
@@ -224,7 +233,7 @@ def _alltalk_running():
         return None, None
     if "alltalk_environment" not in _process_exe(pid).lower():
         return None, None
-    return ("cpu" if mode == "cpu" else "cuda"), pid
+    return _alltalk_mode(mode), pid
 
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
@@ -610,18 +619,24 @@ class MicControlPanel:
             pady=2, command=self._restart_alltalk
         ).grid(row=0, column=2, sticky="ew", padx=(2, 0))
 
-        # AllTalk mode: graphics card (CUDA) or main processor (CPU)
+        # AllTalk mode: graphics card, or main processor without / with streaming
         mode_frame = tk.Frame(parent)
         mode_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
         self._alltalk_switching = False
-        self._alltalk_mode_label = tk.Label(mode_frame, text="AllTalk: ...", font=("Segoe UI", 8), anchor="w")
+        self._alltalk_mode_label = tk.Label(mode_frame, text="AllTalk: ...", font=("Segoe UI", 8), anchor="w",
+                                            justify=tk.LEFT, wraplength=250)
         self._alltalk_mode_label.pack(fill=tk.X)
-        self._alltalk_mode_btn = tk.Button(
-            mode_frame, text="Switch AllTalk mode", font=("Segoe UI", 8, "bold"),
-            bg="#2196F3", fg="white", activebackground="#1976D2",
-            pady=2, command=self._switch_alltalk_mode
-        )
-        self._alltalk_mode_btn.pack(fill=tk.X)
+        btn_row = tk.Frame(mode_frame)
+        btn_row.pack(fill=tk.X)
+        self._alltalk_mode_btns = {}
+        for col, (mode, text) in enumerate((("cuda", "Graphics card"), ("cpu", "CPU, no stream"),
+                                            ("cpu_stream", "CPU + stream"))):
+            btn_row.columnconfigure(col, weight=1)
+            b = tk.Button(btn_row, text=text, font=("Segoe UI", 7, "bold"),
+                          bg="#2196F3", fg="white", activebackground="#1976D2", pady=2,
+                          command=lambda m=mode: self._switch_alltalk_mode(m))
+            b.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 2, 0))
+            self._alltalk_mode_btns[mode] = b
         self.root.after(500, self._refresh_alltalk_mode)
 
         # Shutdown Services dropdown
@@ -1152,11 +1167,13 @@ TTS PAUSE
                 text = f"AllTalk: on the {_alltalk_mode_label(running)}"
             else:
                 text = f"AllTalk: not running (saved: {_alltalk_mode_label(saved)})"
-            target = "cuda" if (running or saved) == "cpu" else "cpu"
+            current = running or saved
             self._alltalk_mode_label.config(text=text)
-            self._alltalk_mode_btn.config(
-                text=f"Switch AllTalk to {_alltalk_mode_label(target)}",
-                state=tk.DISABLED if self._alltalk_switching else tk.NORMAL)
+            for mode, b in self._alltalk_mode_btns.items():
+                active = mode == current
+                b.config(relief=tk.SUNKEN if active else tk.RAISED,
+                         bg="#0D47A1" if active else "#2196F3",
+                         state=tk.DISABLED if (self._alltalk_switching or active) else tk.NORMAL)
         except Exception:
             logger.exception("AllTalk mode refresh failed")
         self.root.after(3000, self._refresh_alltalk_mode)
@@ -1172,13 +1189,12 @@ TTS PAUSE
             time.sleep(2)
         return False
 
-    def _switch_alltalk_mode(self):
-        """Flip AllTalk between the graphics card and the main processor.
+    def _switch_alltalk_mode(self, new):
+        """Put AllTalk on the graphics card or the main processor (without / with streaming).
 
         Only the saved mode is written; launch_alltalk.bat, wherever it runs AllTalk,
         sees it and restarts AllTalk in the new mode."""
         running, old_pid = _alltalk_running()
-        new = "cuda" if (running or _alltalk_saved_mode()) == "cpu" else "cpu"
         _write_alltalk_file(ALLTALK_MODE_FILE, new)
         label = _alltalk_mode_label(new)
         logger.info(f"AllTalk mode set to {new} (running: {running})")
