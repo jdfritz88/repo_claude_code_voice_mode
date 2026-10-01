@@ -11,6 +11,8 @@ import io
 import json
 import logging
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -36,6 +38,16 @@ CHANNELS = 1
 VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive filtering
 STREAMING_CHUNK_SIZE = 4096  # bytes per iter_content chunk
 WAV_HEADER_SIZE = 44  # standard WAV header
+
+# AllTalk's mode, written by REPO_alltalk\launch_alltalk.bat when it starts AllTalk:
+# cuda (graphics card), cpu (main processor WITHOUT streaming - AllTalk refuses streaming)
+# or cpu_stream (main processor with streaming). Missing/unknown = cuda.
+ALLTALK_RUNNING_MODE_FILE = Path(r"F:\Apps\freedom_system\REPO_alltalk\runtime\running_mode.txt")
+# Whole-clip wait on the main processor. Measured 2026-09-30 on this PC: a 329-character
+# Freya paragraph took 36.7 s (0.11 s per character). The wait allows ~2.3x that, because
+# other sessions can be using AllTalk at the same time. Graphics card mode keeps 30 s.
+CPU_WHOLE_CLIP_BASE_S = 60
+CPU_WHOLE_CLIP_S_PER_CHAR = 0.25
 
 # Logs live in this repo's own logs/ folder, derived from this file's location
 # so the path follows the repo rather than being pinned to a drive letter.
@@ -491,9 +503,28 @@ def speak_text_streaming(text: str, voice: str) -> dict:
     return {"status": "spoken", "method": "streaming", "voice": voice, "length": len(text)}
 
 
+def _alltalk_mode() -> str:
+    """AllTalk's mode as launch_alltalk.bat started it: cuda, cpu or cpu_stream."""
+    try:
+        mode = ALLTALK_RUNNING_MODE_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return "cuda"
+    return mode if mode in ("cpu", "cpu_stream") else "cuda"
+
+
+def _whole_clip_timeout(text: str) -> float:
+    """How long to wait for a whole clip: 30 s on the graphics card, length-based on the
+    main processor (where a long reply can take minutes)."""
+    if _alltalk_mode() == "cuda":
+        return 30
+    return CPU_WHOLE_CLIP_BASE_S + CPU_WHOLE_CLIP_S_PER_CHAR * len(text)
+
+
 def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
     """Speak using non-streaming methods only (Methods 2/3). Used for recovery."""
     voice = voice or current_voice
+    timeout = _whole_clip_timeout(text)
+    started = time.monotonic()
 
     # Method 2: OpenAI-compatible endpoint
     try:
@@ -501,13 +532,21 @@ def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
         response = requests.post(
             f"{ALLTALK_URL}/v1/audio/speech",
             json={"input": text, "voice": voice, "model": "tts-1", "response_format": "wav"},
-            timeout=30,
+            timeout=timeout,
         )
         if response.status_code == 200:
             play_audio_bytes(response.content)
             logger.info(f"[NONSTREAM] Method 2 success: {len(response.content)} bytes")
             return {"status": "spoken", "method": "nonstreaming_openai", "voice": voice, "length": len(text)}
     except Exception as e:
+        # Ran out of time: AllTalk is still making this clip, and asking again (Method 3)
+        # would only queue the same text a second time behind it - on the main processor
+        # that cost 10-20 minutes. Judged by elapsed time, because a timeout while the clip
+        # is downloading comes back as ConnectionError, not ReadTimeout.
+        if isinstance(e, requests.exceptions.Timeout) or time.monotonic() - started >= timeout * 0.9:
+            logger.warning(f"[NONSTREAM] Method 2 timed out after {time.monotonic() - started:.0f}s "
+                           f"(allowed {timeout:.0f}s): {e} - not asking again")
+            return {"status": "error", "message": f"AllTalk did not finish the clip within {timeout:.0f}s"}
         logger.warning(f"[NONSTREAM] Method 2 failed: {e}")
 
     # Method 3: AllTalk native endpoint
@@ -530,7 +569,7 @@ def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
             "temperature": str(current_temperature),
             "repetition_penalty": "10.0",
         }
-        response = requests.post(f"{ALLTALK_URL}/api/tts-generate", data=payload, timeout=30)
+        response = requests.post(f"{ALLTALK_URL}/api/tts-generate", data=payload, timeout=timeout)
         if response.status_code == 200:
             result = response.json()
             audio_url = result.get("output_file_url", "")
@@ -660,6 +699,49 @@ def _handle_streaming_failure(original_text: str, voice: str) -> dict:
     }
 
 
+VOICE_MISSING_ALERT_FILE = LOG_DIR / "voice_missing_alert.json"
+VOICE_MISSING_ALERT_EVERY = 30 * 60  # seconds between message boxes
+
+
+def _voice_missing_from_alltalk(voice: str) -> Optional[dict]:
+    """If AllTalk is running but doesn't list `voice`, it was started without the
+    REPO_alltalk layer (e.g. its own start_alltalk.bat), so the user's voices from
+    F:\\Apps\\freedom_system\\user_voice_files are missing. Tell the user with a message
+    box (at most every 30 minutes) and return an error instead of a doomed attempt.
+    Returns None when the voice is available or AllTalk can't be asked."""
+    try:
+        r = requests.get(f"{ALLTALK_URL}/api/voices", timeout=3)
+        voices = r.json().get("voices", []) if r.ok else None
+    except Exception:
+        return None  # AllTalk offline/unreachable: the normal speak flow handles that
+    if not voices or voice.lower() in (v.lower() for v in voices):
+        return None
+    msg = (f"AllTalk is running WITHOUT your voices - '{voice}' is not in its voice list "
+           f"({len(voices)} voices listed).\n\n"
+           "It was most likely started with AllTalk's own start_alltalk.bat, which skips "
+           "REPO_alltalk and your folder F:\\Apps\\freedom_system\\user_voice_files.\n\n"
+           "Fix: close AllTalk's window, then start it with the shortcut\n"
+           "F:\\Apps\\freedom_system\\app_cabinet\\AllTalk (with my voices)\n"
+           "(or 'Oobabooga (with my voices)', or voice mode's mic panel).")
+    logger.error(f"Voice '{voice}' missing from AllTalk ({len(voices)} voices) - AllTalk started without REPO_alltalk")
+    try:
+        last = json.loads(VOICE_MISSING_ALERT_FILE.read_text(encoding="utf-8")).get("last", 0)
+    except Exception:
+        last = 0
+    if time.time() - last >= VOICE_MISSING_ALERT_EVERY:
+        try:
+            VOICE_MISSING_ALERT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            VOICE_MISSING_ALERT_FILE.write_text(json.dumps({"last": time.time()}), encoding="utf-8")
+            code = ("import ctypes,sys;ctypes.windll.user32.MessageBoxW(0,sys.argv[1],"
+                    "'Voice mode: AllTalk started without your voices',0x30|0x10000|0x40000)")
+            subprocess.Popen([sys.executable, "-c", code, msg],
+                             creationflags=0x00000008 | 0x00000200 | 0x08000000,  # detached, no window
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logger.error(f"Could not show the voice-missing message box: {e}")
+    return {"status": "error", "message": msg}
+
+
 def speak_text(text: str, voice: Optional[str] = None) -> dict:
     """Send text to AllTalk TTS and play the result.
 
@@ -681,7 +763,16 @@ def speak_text(text: str, voice: Optional[str] = None) -> dict:
         return {"status": "paused", "message": "TTS is currently paused via mic panel"}
 
     voice = voice or current_voice
+    missing = _voice_missing_from_alltalk(voice)
+    if missing:
+        return missing
     logger.info(f"Speaking: '{text[:80]}...' with voice={voice}")
+
+    # Main processor without streaming (launch_alltalk.bat mode "cpu"): AllTalk refuses
+    # streaming there, so go straight to the whole clip.
+    if _alltalk_mode() == "cpu":
+        logger.info("AllTalk is on the main processor without streaming - whole clip")
+        return speak_text_nonstreaming(text, voice)
 
     # Method 1: Streaming (fastest — plays audio as it's generated)
     if _streaming_available is not False:
